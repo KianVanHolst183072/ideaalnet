@@ -30,7 +30,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from . import tokens
 from . import landing
-from .templates import info_change, platform_registration
+from .templates import info_change, platform_registration, password_reset
 
 app = FastAPI(
     title="Ideaalnet Email API",
@@ -110,6 +110,16 @@ class PlatformRegistrationRequest(BaseModel):
     onderwijsniveau: str | None = Field(None, description="Education level", examples=["Middelbaar onderwijs of MBO"])
     regio: str | None = Field(None, description="Region", examples=["Nederland"])
     info: str | None = Field(None, description="Free-form additional info from the prospect", examples=["Graag meer info over groepslicenties."])
+
+
+class PasswordResetRequest(BaseModel):
+    """Payload for a password reset request. Sent by Botpress when a user
+    asks to reset their password.
+
+    The API always responds with success even if the email isn't registered,
+    to prevent email enumeration attacks.
+    """
+    email: EmailStr = Field(..., description="Email address that requested the reset", examples=["klant@example.com"])
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -468,6 +478,47 @@ def submit_platform_registration(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Password reset flow
+#
+# Botpress calls this when a user requests a password reset. Renders a single
+# reset email containing a link to the (external) "set new password" page.
+#
+# The reset URL is configurable via the RESET_PAGE_URL env var; default is
+# https://app.ideaalnet.org/reset.
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/password_reset/request", tags=["password_reset"])
+def request_password_reset(
+    payload: PasswordResetRequest,
+    x_api_key: str | None = Header(default=None),
+):
+    """
+    Request a password reset. Called by Botpress.
+
+    Renders the reset email containing a link to the external "set new
+    password" page.
+
+    Requires `x-api-key` header to match the `API_KEY` env var (if set).
+    """
+    require_api_key(x_api_key)
+
+    reset_link = os.environ.get("RESET_PAGE_URL", "https://app.ideaalnet.org/reset")
+
+    html = password_reset.user_reset(
+        reset_link=reset_link,
+        expires_in_minutes=15,
+    )
+
+    return {
+        "status": "rendered",
+        "flow": "password_reset",
+        "recipient": payload.email,
+        "reset_link": reset_link,
+        **save_preview("password_reset_user.html", html),
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Hub page HTML — styled to match the dashboard
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -606,6 +657,23 @@ def _hub_html() -> str:
         <div class="step-desc">Automatisch antwoord dat de aanmelding goed ontvangen is.</div>
       </div>
       <a class="step-link" href="#" onclick="quickGeneratePlatform('autoreply'); return false;">Genereer voorbeeld</a>
+    </div>
+  </div>
+
+  <div class="section-title">Wachtwoord reset</div>
+  <div class="flow-card">
+    <div class="flow-header">
+      <span class="flow-name">password_reset</span>
+      <span class="flow-tag">Live</span>
+    </div>
+
+    <div class="step-row">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <div class="step-title">Reset-link aan klant</div>
+        <div class="step-desc">Verstuurd op verzoek via de chatbot. Link is 15 minuten geldig.</div>
+      </div>
+      <a class="step-link" href="#" onclick="quickGeneratePasswordReset(); return false;">Genereer voorbeeld</a>
     </div>
   </div>
 
@@ -762,6 +830,25 @@ async function quickGeneratePlatform(which) {{
       : data.customer_autoreply?.url;
     if (target) {{
       window.open(target, '_blank');
+      loadSaved();
+    }} else {{
+      alert('Onverwacht antwoord: ' + JSON.stringify(data));
+    }}
+  }} catch (e) {{
+    alert('Fout: ' + e.message);
+  }}
+}}
+
+async function quickGeneratePasswordReset() {{
+  try {{
+    const res = await fetch('/api/password_reset/request', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ email: 'klant@example.com' }}),
+    }});
+    const data = await res.json();
+    if (data.url) {{
+      window.open(data.url, '_blank');
       loadSaved();
     }} else {{
       alert('Onverwacht antwoord: ' + JSON.stringify(data));
