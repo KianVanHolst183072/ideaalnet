@@ -1,40 +1,61 @@
 """
-Ideaalnet Email Notification API — preview mode.
+Ideaalnet Email Notification API.
 
-Currently this API does not send any emails. Each endpoint renders an HTML email
-template and saves it as a file in the previews/ directory so you can open it in
-the browser or download it. SMTP sending will be wired in once the mail server
-is configured.
+Implements the customer-info-change flow with token-based confirmation:
 
-Endpoint conventions:
-  /preview/<flow>/<step>     GET  — render HTML inline in browser
-  /api/<flow>/<step>         POST — render HTML, save to disk, return file URL
+  1. Botpress  → POST /api/info_change/user_confirm
+                   → generates token, renders user_confirm email
+                   → returns confirm_link the user would click
+  2. User      → GET  /confirm/{token}
+                   → validates token, renders support_review email
+                   → returns landing page + approve_link for support
+  3. Support   → GET  /approve/{token}
+                   → validates token, renders user_final email
+                   → returns landing page confirming the change is applied
 
-Currently implemented flow:
-  info_change : user_confirm → support_review → user_final
+Until SMTP is wired up, emails are saved to `previews/` and the relevant
+clickable link is returned in the API response (and shown on landing pages).
 
-Future flows will follow the same pattern (orders, repairs, delivery, etc.).
+Future flows (order_status, repair_status, delivery, etc.) follow the same
+pattern under their own module in api/templates/.
 """
 
 import os
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 
+from . import tokens
+from . import landing
 from .templates import info_change
 
 app = FastAPI(
     title="Ideaalnet Email API",
     description=(
-        "Generates and previews customer service emails. "
-        "Currently in **preview mode** — no emails are sent. "
-        "Each POST endpoint renders the template and saves it to `previews/` for inspection."
+        "Customer service email flows with token-based confirmation. "
+        "Implements the info-change flow (name/address/phone/email updates) "
+        "with full 3-step approval chain. Email previews are saved to `previews/` "
+        "and clickable links are functional even before SMTP is wired up."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
+
+
+def base_url(request_headers: dict | None = None) -> str:
+    """Build the public base URL for emails/links.
+
+    Priority:
+      1. PUBLIC_BASE_URL env var (set this on Vercel)
+      2. Forwarded host header (when behind a proxy)
+      3. http://127.0.0.1:8000 (local dev fallback)
+    """
+    env_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    if env_url:
+        return env_url
+    return "http://127.0.0.1:8000"
 
 # Directory where rendered previews are saved.
 # Default to <project-root>/previews so it's always in the same place, regardless
@@ -152,7 +173,7 @@ def delete_all_saved_previews():
 
 @app.get("/api/debug", tags=["previews"])
 def debug_storage():
-    """Diagnostic: shows exactly where previews are being saved and verifies writability."""
+    """Diagnostic: shows where previews are saved and which token backend is active."""
     import sys
     test_file = PREVIEW_DIR / ".write_test"
     writable = False
@@ -173,75 +194,198 @@ def debug_storage():
         "files_in_dir": sorted([p.name for p in PREVIEW_DIR.glob("*")]) if PREVIEW_DIR.exists() else [],
         "cwd": os.getcwd(),
         "is_vercel": bool(os.environ.get("VERCEL")),
+        "token_backend": "redis" if tokens.using_redis() else "memory (NOT for production!)",
+        "public_base_url": base_url(),
+        "api_key_set": bool(os.environ.get("API_KEY")),
         "python_version": sys.version,
     }
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Info change flow — POST endpoints (Swagger UI: fill in fields → Execute → view)
+# Info change flow
+#
+# Botpress calls only step 1 (user_confirm). The remaining steps are triggered
+# by users clicking links in the emails. Steps 2 and 3 are also exposed as POST
+# endpoints for testing in isolation.
 # ────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/info_change/user_confirm", tags=["info_change"])
-def generate_user_confirm(
+def start_info_change(
     payload: InfoChangeRequest,
     x_api_key: str | None = Header(default=None),
 ):
     """
-    Generate the **customer confirmation** email.
+    **Start** the info-change flow. Called by Botpress.
 
-    **This is the endpoint Botpress calls** to start the info-change flow.
-    In production it will both generate AND send the email; right now it only
-    renders and saves it as a file in `previews/`.
+    1. Generates a confirmation token (valid for 15 minutes)
+    2. Renders the customer confirmation email with a real, clickable link
+    3. Saves the email to `previews/` and returns the URL + the confirm link
+
+    In production the email will be sent via SMTP. Until then, the response
+    contains `confirm_link` which is the URL the customer would click — open
+    it in your browser to continue the flow manually.
 
     Requires `x-api-key` header to match the `API_KEY` env var (if set).
     """
     require_api_key(x_api_key)
+
+    token = tokens.create_token({
+        "email": payload.email,
+        "field": payload.field,
+        "oldfield": payload.oldfield,
+        "newfield": payload.newfield,
+    })
+
+    confirm_link = f"{base_url()}/confirm/{token}"
+
     html = info_change.user_confirm(
         payload.field, payload.oldfield, payload.newfield,
-        confirm_link="#preview-mode-no-real-link",
+        confirm_link=confirm_link,
     )
+
     return {
         "status": "rendered",
         "flow": "info_change",
         "step": "user_confirm",
         "recipient": payload.email,
-        **save_preview(f"info_change_user_confirm.html", html),
+        "token": token,
+        "confirm_link": confirm_link,
+        "expires_in_seconds": tokens.TOKEN_TTL_SECONDS,
+        **save_preview("info_change_user_confirm.html", html),
     }
 
 
-@app.post("/api/info_change/support_review", tags=["info_change"])
-def generate_support_review(payload: SupportReviewRequest):
+@app.get("/confirm/{token}", response_class=HTMLResponse, tags=["info_change"])
+def confirm_change(token: str):
     """
-    Generate the **customer-support review** email.
+    User-facing link from the customer confirmation email.
 
-    Triggered after the customer clicks their confirmation link.
+    Validates the token, advances it to `pending_support`, renders the
+    customer-support review email with a real approve link, and shows the
+    customer a "thanks, support has been notified" landing page.
+
+    Until SMTP is wired up, the approve link is also shown on the landing
+    page so you can click through and continue the flow manually.
     """
+    data = tokens.get_token(token)
+    if not data:
+        return landing.landing_page(
+            title="Link verlopen",
+            heading="Deze link is niet meer geldig",
+            message="De bevestigingslink is verlopen of al gebruikt. Vraag opnieuw een wijziging aan via de chat.",
+            variant="danger",
+        )
+
+    if data.get("status") != tokens.STATUS_PENDING_USER:
+        return landing.landing_page(
+            title="Al bevestigd",
+            heading="Wijziging is al bevestigd",
+            message="Deze wijziging is al doorgegeven aan onze klantenservice. U ontvangt een e-mail zodra de wijziging is verwerkt.",
+            variant="info",
+        )
+
+    tokens.update_status(token, tokens.STATUS_PENDING_SUPPORT, clear_expiry=True)
+
+    approve_link = f"{base_url()}/approve/{token}"
+
+    # Render the email customer support would receive
+    html = info_change.support_review(
+        data["email"], data["field"], data["oldfield"], data["newfield"],
+        approve_link=approve_link,
+    )
+    save_preview("info_change_support_review.html", html)
+
+    return landing.landing_page(
+        title="Bevestigd",
+        heading="Bedankt voor uw bevestiging",
+        message=(
+            f"Uw wijzigingsverzoek voor <strong>{data['field']}</strong> is doorgestuurd "
+            "naar onze klantenservice. U ontvangt een e-mail zodra de wijziging is verwerkt."
+        ),
+        variant="success",
+        extra_html=landing.dev_link_block(
+            "Customer Support actie (dev)",
+            approve_link,
+        ),
+    )
+
+
+@app.get("/approve/{token}", response_class=HTMLResponse, tags=["info_change"])
+def approve_change(token: str):
+    """
+    Support-facing link from the support review email.
+
+    Validates the token, advances it to `approved`, renders the final
+    confirmation email to the customer, and shows the support agent a
+    "change applied" landing page. After this the token is deleted.
+    """
+    data = tokens.get_token(token)
+    if not data:
+        return landing.landing_page(
+            title="Link verlopen",
+            heading="Deze goedkeuringslink is niet meer geldig",
+            message="De link is verlopen of al gebruikt. Vraag de klant indien nodig opnieuw een wijziging aan.",
+            variant="danger",
+        )
+
+    if data.get("status") != tokens.STATUS_PENDING_SUPPORT:
+        return landing.landing_page(
+            title="Reeds verwerkt",
+            heading="Deze wijziging is al verwerkt",
+            message="Het lijkt erop dat deze wijziging al is goedgekeurd of nog wacht op klantbevestiging.",
+            variant="warn",
+        )
+
+    tokens.update_status(token, tokens.STATUS_APPROVED)
+
+    # Render the final email to the customer
+    html = info_change.user_final(data["field"], data["oldfield"], data["newfield"])
+    save_preview("info_change_user_final.html", html)
+
+    # Clean up — flow complete
+    tokens.delete_token(token)
+
+    return landing.landing_page(
+        title="Wijziging doorgevoerd",
+        heading="Wijziging goedgekeurd",
+        message=(
+            f"De wijziging van <strong>{data['field']}</strong> voor "
+            f"<strong>{data['email']}</strong> is goedgekeurd. De klant ontvangt een bevestiging."
+        ),
+        variant="success",
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Standalone test endpoints — render any step in isolation without a token.
+# Useful for previewing email designs in Swagger.
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/info_change/support_review", tags=["info_change (test)"])
+def generate_support_review(payload: SupportReviewRequest):
+    """Standalone render of the support-review email (no token, for design preview only)."""
     html = info_change.support_review(
         payload.customer_email, payload.field, payload.oldfield, payload.newfield,
-        approve_link="#preview-mode-no-real-link",
+        approve_link="#standalone-preview",
     )
     return {
         "status": "rendered",
         "flow": "info_change",
         "step": "support_review",
-        **save_preview(f"info_change_support_review.html", html),
+        **save_preview("info_change_support_review.html", html),
     }
 
 
-@app.post("/api/info_change/user_final", tags=["info_change"])
+@app.post("/api/info_change/user_final", tags=["info_change (test)"])
 def generate_user_final(payload: InfoChangeRequest):
-    """
-    Generate the **final confirmation** email to the customer.
-
-    Triggered after customer support approves the change.
-    """
+    """Standalone render of the final confirmation email (no token, for design preview only)."""
     html = info_change.user_final(payload.field, payload.oldfield, payload.newfield)
     return {
         "status": "rendered",
         "flow": "info_change",
         "step": "user_final",
         "recipient": payload.email,
-        **save_preview(f"info_change_user_final.html", html),
+        **save_preview("info_change_user_final.html", html),
     }
 
 
