@@ -30,7 +30,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from . import tokens
 from . import landing
-from .templates import info_change
+from .templates import info_change, platform_registration
 
 app = FastAPI(
     title="Ideaalnet Email API",
@@ -94,6 +94,22 @@ class SupportReviewRequest(BaseModel):
     field: str = Field(..., examples=["telefoonnummer"])
     oldfield: str = Field("", examples=["+31 6 1234 5678"])
     newfield: str = Field("", examples=["+31 6 9876 5432"])
+
+
+class PlatformRegistrationRequest(BaseModel):
+    """Payload for a new platform registration. Sent by Botpress when a prospect
+    applies for the Ideaalnet platform through the chatbot.
+
+    Only `naam` and `email` are required — everything else is optional and only
+    appears in the support notification if a value is provided.
+    """
+    naam: str = Field(..., description="Full name of the prospect", examples=["Jan de Vries"])
+    email: EmailStr = Field(..., description="Email address for the auto-reply", examples=["jan@school.nl"])
+    rol: str | None = Field(None, description="Role (e.g. ouder, student, schoolbeheerder)", examples=["Student/scholier"])
+    schoolnaam: str | None = Field(None, description="School or organisation name", examples=["Het Goede Voorbeeld"])
+    onderwijsniveau: str | None = Field(None, description="Education level", examples=["Middelbaar onderwijs of MBO"])
+    regio: str | None = Field(None, description="Region", examples=["Nederland"])
+    info: str | None = Field(None, description="Free-form additional info from the prospect", examples=["Graag meer info over groepslicenties."])
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -390,6 +406,68 @@ def generate_user_final(payload: InfoChangeRequest):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Platform registration flow
+#
+# Botpress calls this once when a prospect completes the registration chat.
+# Generates two emails in a single call:
+#   1. Support notification — full registration details for the team to follow up
+#   2. Customer auto-reply  — confirms receipt to the prospect
+#
+# No tokens, no confirmation steps — the human team takes it from here.
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/platform_registration/submit", tags=["platform_registration"])
+def submit_platform_registration(
+    payload: PlatformRegistrationRequest,
+    x_api_key: str | None = Header(default=None),
+):
+    """
+    **Submit** a new platform registration. Called by Botpress.
+
+    Generates both emails (support notification + customer auto-reply) and
+    saves them to `previews/`. Optional fields are only rendered if a value
+    is provided.
+
+    Requires `x-api-key` header to match the `API_KEY` env var (if set).
+    """
+    require_api_key(x_api_key)
+
+    # Generate the support notification email
+    support_html = platform_registration.support_notification(
+        naam=payload.naam,
+        email=payload.email,
+        rol=payload.rol,
+        schoolnaam=payload.schoolnaam,
+        onderwijsniveau=payload.onderwijsniveau,
+        regio=payload.regio,
+        info=payload.info,
+    )
+    support_saved = save_preview("platform_registration_support.html", support_html)
+
+    # Generate the customer auto-reply
+    customer_html = platform_registration.customer_autoreply(naam=payload.naam)
+    customer_saved = save_preview("platform_registration_autoreply.html", customer_html)
+
+    return {
+        "status": "rendered",
+        "flow": "platform_registration",
+        "applicant": {"naam": payload.naam, "email": payload.email},
+        "support_email": {
+            "recipient": "customer-support",  # TODO: replace with SUPPORT_EMAIL once SMTP is wired
+            "url": support_saved["url"],
+            "saved_as": support_saved["saved_as"],
+            "size_bytes": support_saved["size_bytes"],
+        },
+        "customer_autoreply": {
+            "recipient": payload.email,
+            "url": customer_saved["url"],
+            "saved_as": customer_saved["saved_as"],
+            "size_bytes": customer_saved["size_bytes"],
+        },
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Hub page HTML — styled to match the dashboard
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -502,6 +580,32 @@ def _hub_html() -> str:
         <div class="step-desc">Wordt verstuurd nadat klantenservice de wijziging goedkeurt.</div>
       </div>
       <a class="step-link" href="#" onclick="quickGenerate('info_change', 'user_final', this); return false;">Genereer voorbeeld</a>
+    </div>
+  </div>
+
+  <div class="section-title">Platform aanmelding</div>
+  <div class="flow-card">
+    <div class="flow-header">
+      <span class="flow-name">platform_registration</span>
+      <span class="flow-tag">Live</span>
+    </div>
+
+    <div class="step-row">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <div class="step-title">Notificatie aan klantenservice</div>
+        <div class="step-desc">Alle aanmeldgegevens voor handmatige opvolging door het team.</div>
+      </div>
+      <a class="step-link" href="#" onclick="quickGeneratePlatform('support'); return false;">Genereer voorbeeld</a>
+    </div>
+
+    <div class="step-row">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <div class="step-title">Bevestiging aan aanmelder</div>
+        <div class="step-desc">Automatisch antwoord dat de aanmelding goed ontvangen is.</div>
+      </div>
+      <a class="step-link" href="#" onclick="quickGeneratePlatform('autoreply'); return false;">Genereer voorbeeld</a>
     </div>
   </div>
 
@@ -630,6 +734,40 @@ async function quickGenerate(flow, step, btn) {{
   }} finally {{
     btn.textContent = original;
     btn.style.opacity = '1';
+  }}
+}}
+
+async function quickGeneratePlatform(which) {{
+  // Sample registration payload with all optional fields filled in.
+  const sample = {{
+    naam: 'Jan de Vries',
+    email: 'jan@school.nl',
+    rol: 'Student/scholier',
+    schoolnaam: 'Het Goede Voorbeeld',
+    onderwijsniveau: 'Middelbaar onderwijs of MBO',
+    regio: 'Nederland',
+    info: 'Graag meer informatie over groepslicenties en mogelijke kortingen voor scholen.',
+  }};
+
+  try {{
+    const res = await fetch('/api/platform_registration/submit', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(sample),
+    }});
+    const data = await res.json();
+    // Open whichever email the user clicked on
+    const target = which === 'support'
+      ? data.support_email?.url
+      : data.customer_autoreply?.url;
+    if (target) {{
+      window.open(target, '_blank');
+      loadSaved();
+    }} else {{
+      alert('Onverwacht antwoord: ' + JSON.stringify(data));
+    }}
+  }} catch (e) {{
+    alert('Fout: ' + e.message);
   }}
 }}
 </script>
